@@ -836,18 +836,31 @@ class ScanTest(unittest.TestCase):
         artists = [{"name": "The Artist"}]
         red_torrent = torrent_edition(
             id=42,
-            remasterCatalogueNumber="",
+            media="Blu-Ray",
+            remasterTitle="40th Anniversary 5.1 Mix",
             fileCount=2,
             size=300,
             fileList="Disc/track.flac{{{275}}}|||cover.png{{{25}}}",
         )
         group = {"id": 5, "name": "Album", "musicInfo": {"artists": artists}}
+        ops_edition = {
+            "media": "BD",
+            "remasterTitle": "40th Anniversary Edition / 5.1 Multichannel",
+        }
         ops_torrents = [
-            torrent_edition(id=90, fileCount=2, size=300),
-            torrent_edition(id=91, fileCount=2, size=300),
-            torrent_edition(id=92, fileCount=3, size=300),
-            torrent_edition(id=93, fileCount=2, size=400),
-            torrent_edition(id=94, format="MP3", encoding="320", fileCount=2, size=300),
+            torrent_edition(id=90, fileCount=2, size=300, **ops_edition),
+            torrent_edition(id=91, fileCount=2, size=300, **ops_edition),
+            torrent_edition(id=92, fileCount=3, size=300, **ops_edition),
+            torrent_edition(id=93, fileCount=2, size=400, **ops_edition),
+            torrent_edition(
+                id=94,
+                format="MP3",
+                encoding="320",
+                fileCount=2,
+                size=300,
+                **ops_edition,
+            ),
+            torrent_edition(id=95, media="DVD", fileCount=2, size=300),
         ]
         ops_lists = {
             90: "cover.png{{{25}}}|||Disc/track.flac{{{275}}}",
@@ -914,6 +927,10 @@ class ScanTest(unittest.TestCase):
                     )
                     (saved,) = json.loads(partial_path.read_text(encoding="utf-8"))
                     self.assertEqual(4, len(saved["ops_urls"]))
+                    self.assertEqual(
+                        ["edition title differs"],
+                        saved["match_exceptions"][app.site_link(app.OPS, 8, 90)],
+                    )
                     self.assertEqual(2, len(saved["file_check"]["candidates"]))
                     self.assertNotIn(
                         "Disc/track.flac", partial_path.read_text(encoding="utf-8")
@@ -1118,7 +1135,7 @@ class ScanTest(unittest.TestCase):
 
         self.assertIs(
             source.compare(app.Edition(2016, "EMI", "", "Different Remaster", "WEB")),
-            False,
+            True,
         )
         self.assertIs(
             source.compare(app.Edition(2016, "", "DIGITAL 123", "", "WEB")), True

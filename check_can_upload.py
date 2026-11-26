@@ -318,6 +318,11 @@ def normalized(value):
     return unicodedata.normalize("NFC", display(value)).casefold()
 
 
+def media_key(value):
+    media = normalized(value)
+    return "blu-ray" if media == "bd" else media
+
+
 def title_key(value):
     text = normalized(value).translate(str.maketrans("", "", ",'\"‘’“”"))
     return " ".join(re.sub(r"\s*[-–—]\s*", "-", text).split())
@@ -386,10 +391,9 @@ class Edition:
     def compare(self, other):
         required = (
             (self.year, other.year),
-            (normalized(self.media), normalized(other.media)),
+            (media_key(self.media), media_key(other.media)),
         )
-        titles = (title_key(self.title), title_key(other.title))
-        if any(a and b and a != b for a, b in (*required, titles)):
+        if any(a and b and a != b for a, b in required):
             return False
         left_label, right_label = normalized(self.label), normalized(other.label)
         if left_label and right_label and not labels_match(left_label, right_label):
@@ -401,7 +405,7 @@ class Edition:
             field
             for field, value in (
                 ("edition year", self.year),
-                ("media", normalized(self.media)),
+                ("media", media_key(self.media)),
             )
             if not value
         ]
@@ -635,7 +639,7 @@ def ops_matches(groups, group_details, title, artists, edition, format_pair):
                     normalized(candidate.label),
                     candidate.catalogue_key(),
                     normalized(candidate.title),
-                    normalized(candidate.media),
+                    media_key(candidate.media),
                 ),
             )
     if uncertain and not any(
@@ -823,7 +827,7 @@ class PartialFileVerifier:
             del candidates[url]
             if (
                 manifest == expected
-                and normalized(torrent.get("media")) == normalized(row["media"])
+                and media_key(torrent.get("media")) == media_key(row["media"])
                 and audio_key((torrent.get("format"), torrent.get("encoding")))
                 == audio_key((row["red_format"], row["red_encoding"]))
             ):
