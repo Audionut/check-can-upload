@@ -164,6 +164,7 @@ class Gazelle:
         if self.blocked:
             raise ScanError(self.blocked)
         service = f"{self.site} {action}"
+        download = action == "download"
         for attempt in range(2):
             now = time.monotonic()
             start = max(now, self.next_request)
@@ -186,22 +187,36 @@ class Gazelle:
                 service,
                 headers={
                     "Authorization": self.authorization,
-                    "Accept": "application/json",
+                    "Accept": (
+                        "application/x-bittorrent, application/json, text/plain"
+                        if download
+                        else "application/json"
+                    ),
                 },
                 params={"action": action, **params},
             )
             status = response.status_code
-            if self.debug:
+            content_type = response.headers.get("Content-Type", "").lower()
+            if (
+                download
+                and status == 200
+                and content_type.split(";", 1)[0]
+                in {
+                    "application/x-bittorrent",
+                    "text/plain",
+                }
+            ):
+                body = response.content
+                if body.startswith(b"d") and body.endswith(b"e") and b"4:infod" in body:
+                    return body
+            if self.debug and not download:
                 print(
                     f"[{service} HTTP {status}]\n{response.text}",
                     file=sys.stderr,
                     flush=True,
                 )
             payload = None
-            if (
-                status == 200
-                or "json" in response.headers.get("Content-Type", "").lower()
-            ):
+            if status == 200 or "json" in content_type:
                 try:
                     payload = json_body(response, service)
                 except ScanError:
@@ -210,8 +225,14 @@ class Gazelle:
             if (
                 status == 429
                 or "rate limit" in str(error).casefold()
-                or (payload is None and "rate limit" in response.text[:4096].casefold())
+                or (
+                    (payload is None or download)
+                    and "rate limit" in response.text[:4096].casefold()
+                )
             ):
+                if download:
+                    self.blocked = f"{self.site} rate limited torrent downloads. Try again after the cooldown."
+                    raise ScanError(self.blocked)
                 delay = retry_delay(response.headers.get("Retry-After"))
                 if attempt == 0 and delay <= 60:
                     print(
@@ -237,6 +258,8 @@ class Gazelle:
                     continue
             if status != 200:
                 raise ScanError(f"{service} returned HTTP {status}")
+            if download:
+                raise ScanError(f"{service} did not return a torrent file")
             if (
                 action == "artist"
                 and isinstance(payload, dict)
@@ -735,8 +758,76 @@ def show_missing_ops_formats(record):
         )
 
 
+def save_torrent_file(directory, name, torrent_id, body):
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    if stem.lower().endswith(".torrent"):
+        stem = stem[:-8].rstrip(" .")
+    if not stem:
+        stem = f"OPS {torrent_id}"
+    if re.fullmatch(
+        r"con|prn|aux|nul|(?:com|lpt)[1-9¹²³]", stem.split(".")[0].rstrip(), re.I
+    ):
+        stem = f"_{stem}"
+    for suffix in (".torrent", f" [OPS {torrent_id}].torrent"):
+        # Leave room for the suffix within the filesystem's filename limit.
+        truncated = stem.encode("utf-8")[: 255 - len(suffix)].decode("utf-8", "ignore")
+        path = directory / f"{truncated.rstrip(' .')}{suffix}"
+        try:
+            file = path.open("xb")
+        except FileExistsError:
+            if path.is_file() and path.read_bytes() == body:
+                return path
+            continue
+        try:
+            with file:
+                file.write(body)
+        except (OSError, KeyboardInterrupt):
+            path.unlink(missing_ok=True)
+            raise
+        return path
+    raise ScanError(f"Cannot save OPS torrent {torrent_id}: both filenames are in use")
+
+
+class OpsTorrentDownloader:
+    def __init__(self, ops, directory):
+        self.ops = ops
+        self.directory = directory.resolve()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.failures = 0
+
+    def save(self, record):
+        files, errors = {}, {}
+        for url in record["ops_urls"]:
+            torrent_id = positive_int(
+                parse_qs(urlsplit(url).query).get("torrentid", [None])[0]
+            )
+            try:
+                if torrent_id is None:
+                    raise ScanError("OPS match has no torrent ID")
+                body = self.ops.get("download", id=torrent_id)
+                path = save_torrent_file(
+                    self.directory, record["torrent_name"], torrent_id, body
+                )
+            except (ScanError, OSError) as exc:
+                errors[url] = str(exc)
+                self.failures += 1
+                print(
+                    f"  Could not save OPS torrent {torrent_id} | {exc}",
+                    file=sys.stderr,
+                )
+                if self.ops.blocked:
+                    break
+                continue
+            files[url] = str(path)
+            print(f"  OPS torrent file | {path}", flush=True)
+        if files:
+            record["ops_torrent_files"] = files
+        if errors:
+            record["ops_download_errors"] = errors
+
+
 def write_search_result(
-    reports, row, matches, format_pair, *, source=None, verify=None
+    reports, row, matches, format_pair, *, source=None, verify=None, download=None
 ):
     source_audio = audio_key(format_pair)
     same_audio = {
@@ -781,6 +872,8 @@ def write_search_result(
         }
         record["missing_ops_formats"] = missing_ops_formats(format_pair, available)
     show_missing_ops_formats(record)
+    if name == EXACT_REPORT and download is not None:
+        download(record)
     reports[name].append(record)
     return name
 
@@ -1067,6 +1160,7 @@ def scan(
     rescan,
     new_reports=False,
     verify_partial_files=False,
+    download_ops_torrents=None,
 ):
     print("Reading torrent list from qBittorrent...", flush=True)
     torrents = qbit.get("info", list)
@@ -1185,6 +1279,11 @@ def scan(
 
     counts = dict.fromkeys(REPORT_NAMES, 0)
     verifier = PartialFileVerifier(ops) if verify_partial_files else None
+    downloader = (
+        OpsTorrentDownloader(ops, download_ops_torrents)
+        if download_ops_torrents is not None
+        else None
+    )
     checked_red = skipped = 0
     with ExitStack() as stack:
         reports = {
@@ -1350,11 +1449,12 @@ def scan(
                     format_pair,
                     source=source,
                     verify=verifier.verify if verifier else None,
+                    download=downloader.save if downloader else None,
                 )
                 counts[name] += 1
                 if hash_key:
                     processed.add(hash_key)
-                if verifier and ops.blocked:
+                if (verifier or downloader) and ops.blocked:
                     print(
                         f"Scan stopped with {total_torrents - index} qBittorrent torrents left unscanned.",
                         file=sys.stderr,
@@ -1383,7 +1483,12 @@ def scan(
         f"OPS exact matches {counts[EXACT_REPORT]}, partial matches {counts[PARTIAL_REPORT]}, "
         f"not found {counts[MISSING_REPORT]}, unchecked {counts[UNCHECKED_REPORT]}, already processed {skipped}."
     )
-    return 1 if counts[UNCHECKED_REPORT] or (verifier and verifier.failures) else 0
+    failed = (
+        counts[UNCHECKED_REPORT]
+        or (verifier and verifier.failures)
+        or (downloader and downloader.failures)
+    )
+    return 1 if failed else 0
 
 
 def main(argv=None):
@@ -1450,11 +1555,21 @@ def main(argv=None):
         action="store_true",
         help="verify eligible partials inline with --qbit-url, or verify saved partials on its own",
     )
+    parser.add_argument(
+        "--download-ops-torrents",
+        metavar="DIRECTORY",
+        type=Path,
+        help="save exact OPS matches missing from qBittorrent to this directory",
+    )
     args = parser.parse_args(argv)
     verify_saved = args.verify_partial_files and args.qbit_url is None
     if verify_saved and (args.rescan or args.new_reports):
         parser.error(
             "pass --qbit-url to use --rescan or --new-reports with --verify-partial-files"
+        )
+    if verify_saved and args.download_ops_torrents is not None:
+        parser.error(
+            "pass --qbit-url to verify and download OPS matches in the same scan"
         )
     qbit_url = args.qbit_url or os.getenv("QBIT_URL")
     if not verify_saved and not qbit_url:
@@ -1512,6 +1627,7 @@ def main(argv=None):
                     args.rescan,
                     args.new_reports,
                     args.verify_partial_files,
+                    args.download_ops_torrents,
                 )
     except (ScanError, OSError, ValueError) as exc:
         print(f"Scan failed: {exc}", file=sys.stderr)

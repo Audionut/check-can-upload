@@ -18,6 +18,8 @@ Use `--qbit-api-key` for qBittorrent 5.2 or newer with a WebUI API key. If the W
 
 Add `--debug` to print each RED API response body to the terminal with its endpoint and HTTP status.
 
+Add `--download-ops-torrents 'D:\OPS Torrents'` to a normal scan to save OPS `.torrent` files for exact matches missing from qBittorrent. This includes matches promoted by `--verify-partial-files` during the scan. Each file uses the RED torrent’s name with any Windows filename restrictions applied. A filename collision with a different file adds an `[OPS ID]` suffix. The exact report records saved paths in `ops_torrent_files` and failures in `ops_download_errors`. Use `--rescan` to revisit existing reports with this option.
+
 Add `--verify-partial-files` to a normal command with `--qbit-url` to check eligible partial matches as the scan runs. A normal scan saves evidence for later verification without making extra requests. To verify the latest saved partials on their own, run this with the same `--output-dir` used for the scan:
 
 ```powershell

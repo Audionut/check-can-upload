@@ -15,6 +15,9 @@ import requests
 import check_can_upload as app
 
 
+TORRENT_BODY = b"d8:announce26:https://tracker.test/test/4:infod4:name4:Testee"
+
+
 def torrent_edition(**overrides):
     return {
         "remasterYear": 1992,
@@ -97,7 +100,14 @@ class ScanTest(unittest.TestCase):
         red, ops = Mock(), Mock(url=app.OPS, authorization="token")
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
             output = Path(directory)
-            self.assertEqual(0, app.scan(qbit, red, ops, output, 1, False))
+            downloads = output / "downloads"
+            self.assertEqual(
+                0,
+                app.scan(
+                    qbit, red, ops, output, 1, False, download_ops_torrents=downloads
+                ),
+            )
+            self.assertEqual([], list(downloads.iterdir()))
             (match,) = json.loads(
                 next(output.glob(f"*/{app.EXACT_REPORT}.json")).read_text()
             )
@@ -242,6 +252,13 @@ class ScanTest(unittest.TestCase):
                     url.path == "/ops/ajax.php"
                     and self.headers.get("Authorization") == "token ops-key"
                 ):
+                    if query == {"action": "download", "id": "303"}:
+                        self.reply(
+                            200,
+                            TORRENT_BODY,
+                            **{"Content-Type": "application/x-bittorrent"},
+                        )
+                        return
                     if query == {
                         "action": "artist",
                         "artistname": "Later Artist",
@@ -357,6 +374,8 @@ class ScanTest(unittest.TestCase):
                     "ops-key",
                     "--limit",
                     "2",
+                    "--download-ops-torrents",
+                    str(Path(tmp) / "downloads"),
                     "--debug",
                 )
                 self.assertEqual(0, status, stderr)
@@ -416,6 +435,13 @@ class ScanTest(unittest.TestCase):
                     [f"{base}/ops/torrents.php?id=3&torrentid=303#torrent303"],
                     exact["ops_urls"],
                 )
+                downloaded = Path(tmp) / "downloads" / "Exact copy.torrent"
+                self.assertEqual(TORRENT_BODY, downloaded.read_bytes())
+                self.assertEqual(
+                    {exact["ops_urls"][0]: str(downloaded.resolve())},
+                    exact["ops_torrent_files"],
+                )
+                self.assertEqual([downloaded], list(downloaded.parent.iterdir()))
                 self.assertIs(exact["same_format_and_encoding"], True)
                 self.assertIn("OPS exact matches 1, partial matches 0", stdout)
                 self.assertEqual(
@@ -440,7 +466,16 @@ class ScanTest(unittest.TestCase):
                     when for url, _, when in calls if url == "/red/ajax.php"
                 ]
                 self.assertGreaterEqual(second_red - first_red, 4)
-                self.assertEqual(1, sum(url == "/ops/ajax.php" for url, _, _ in calls))
+                ops_calls = [
+                    (params, when)
+                    for url, params, when in calls
+                    if url == "/ops/ajax.php"
+                ]
+                self.assertEqual(
+                    ["artist", "download"],
+                    [params["action"] for params, _ in ops_calls],
+                )
+                self.assertGreaterEqual(ops_calls[1][1] - ops_calls[0][1], 4)
                 login_status = 200
                 calls.clear()
                 clock.seconds += 61
@@ -534,6 +569,43 @@ class ScanTest(unittest.TestCase):
             finally:
                 server.shutdown()
                 thread.join()
+
+    def test_torrent_download_preserves_existing_file_and_stops_when_rate_limited(self):
+        successful = requests.Response()
+        successful.status_code = 200
+        successful.headers["Content-Type"] = "text/plain"
+        successful._content = TORRENT_BODY
+        limited = requests.Response()
+        limited.status_code = 200
+        limited.headers["Content-Type"] = "application/json"
+        limited._content = (
+            b'{"status":"failure","error":"Rate limiting hit on downloading"}'
+        )
+        first, second, third = (app.site_link(app.OPS, 1, i) for i in (10, 11, 12))
+        row = {"torrent_name": "Artist: Album", "ops_urls": [first, second, third]}
+        ops = app.Gazelle(Mock(), "OPS", app.OPS, "token key", 4)
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            redirect_stdout(StringIO()),
+            redirect_stderr(StringIO()),
+            patch.object(app, "time", Clock()),
+            patch.object(app, "request", side_effect=[successful, limited]) as send,
+        ):
+            directory = Path(folder).resolve()
+            existing = directory / "Artist_ Album.torrent"
+            existing.write_bytes(b"previous file")
+            downloader = app.OpsTorrentDownloader(ops, directory)
+            downloader.save(row)
+            self.assertEqual(b"previous file", existing.read_bytes())
+            downloaded = directory / "Artist_ Album [OPS 10].torrent"
+            self.assertEqual(TORRENT_BODY, downloaded.read_bytes())
+            self.assertEqual({first: str(downloaded)}, row["ops_torrent_files"])
+            self.assertEqual({second: ops.blocked}, row["ops_download_errors"])
+            self.assertEqual({existing, downloaded}, set(directory.iterdir()))
+            self.assertEqual(
+                [{"action": "download", "id": i} for i in (10, 11)],
+                [call.kwargs["params"] for call in send.call_args_list],
+            )
 
     def test_group_lookup_uses_long_window_and_honors_retry_after(self):
         response = Mock(status_code=200, headers={})
@@ -879,6 +951,9 @@ class ScanTest(unittest.TestCase):
                         }
                     ]
                 }
+            if action == "download":
+                self.assertEqual(90, params["id"])
+                return TORRENT_BODY
             self.assertEqual("torrent", action)
             torrent_id = params["id"]
             return {
@@ -908,6 +983,7 @@ class ScanTest(unittest.TestCase):
                 red.get.return_value = {"group": group, "torrent": red_torrent}
                 ops.get.side_effect = ops_request
                 output_dir = Path(tmp)
+                downloads = output_dir / "downloads"
                 self.assertEqual(
                     0,
                     app.scan(
@@ -918,6 +994,7 @@ class ScanTest(unittest.TestCase):
                         limit=1,
                         rescan=False,
                         verify_partial_files=inline,
+                        download_ops_torrents=downloads,
                     ),
                 )
                 (partial_path,) = output_dir.glob("*/ops-partial-matches.json")
@@ -975,6 +1052,12 @@ class ScanTest(unittest.TestCase):
                 )
                 self.assertEqual([app.site_link(app.OPS, 8, 90)], exact["ops_urls"])
                 self.assertEqual("file_list", exact["match_basis"])
+                if inline:
+                    self.assertEqual(
+                        TORRENT_BODY, (downloads / "Album.torrent").read_bytes()
+                    )
+                else:
+                    self.assertEqual([], list(downloads.iterdir()))
                 self.assertEqual(
                     [{"format": "MP3", "encoding": "V0 (VBR)"}],
                     exact["missing_ops_formats"],
